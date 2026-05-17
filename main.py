@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 
 def filter_5core(df: pd.DataFrame, user_col: str, item_col: str, min_cnt: int = 5) -> pd.DataFrame:
-    """Iterative 5-core filtering."""
+    
     while True:
         before = len(df)
         user_counts = df[user_col].value_counts()
@@ -39,12 +39,7 @@ def load_raw_sequences(
     min_cnt: int = 5,
     truncate_to: Optional[int] = 200,
 ) -> Dict[str, List[Tuple[str, int]]]:
-    """Load JSON-lines reviews and return raw per-user event-time sequences.
-
-    Each sequence is a list of (raw_item_id, timestamp_seconds) sorted by event
-    time.  Exact duplicate triples are removed to avoid artificially amplified
-    graph edges.
-    """
+    
     path = Path(data_root) / dataset
     if not path.exists():
         raise FileNotFoundError(f"Dataset file not found: {path}")
@@ -114,14 +109,7 @@ def _sample_event_delays(
     rng: np.random.Generator,
     cfg: DelayConfig,
 ) -> Tuple[List[int], float]:
-    """Sample clipped LogNormal integer delays for one user sequence.
-
-    The delay is measured in the same clock units as the chosen experimental
-    clock. With clock_mode="per_user", one unit means one event step in the
-    user's own sequence, which matches Algorithm 2 and the severity table in
-    the manuscript. With clock_mode="global", one unit means one event in the
-    global timestamp-sorted stream.
-    """
+    
     if T <= 0:
         return [], 0.0
 
@@ -131,9 +119,6 @@ def _sample_event_delays(
 
     base = rng.lognormal(mean=cfg.mu, sigma=cfg.sigma, size=T)
 
-    # For time-varying delay, keep one scale per coarse temporal block rather
-    # than resampling the block factor for every event. This better matches the
-    # manuscript description of transient congestion/device-state changes.
     block_scales: Dict[int, float] = {}
     if cfg.variant in {"time", "user_time"}:
         n_blocks = int(math.ceil(T / max(1, cfg.time_block_size)))
@@ -160,18 +145,7 @@ def map_and_sample_delays(
     seed: int,
     clock_mode: str = "per_user",
 ) -> List[MappedSequence]:
-    """Map raw sequences and sample observation delays.
 
-    clock_mode="per_user" uses event_clocks = 1, ..., T_u inside each user's
-    sequence. This exactly matches the manuscript's censored-history definition
-    t_obs = t + Delta and makes the missing-ratio severity settings interpretable
-    in units of user-event steps.
-
-    clock_mode="global" keeps the timestamp-sorted global event clock. It is
-    useful for production-style ablations, but its delay scale must be
-    recalibrated because one delay unit then means one global log event rather
-    than one user-history step.
-    """
     if clock_mode not in {"per_user", "global"}:
         raise ValueError("clock_mode must be either 'per_user' or 'global'.")
 
@@ -245,15 +219,6 @@ class BufferRecord:
 
 
 class ObservedBipartiteGraph:
-    """Bounded user/item buffers for the observation-time bipartite graph.
-
-    The buffers are pre-built for offline experiments, but the insert_event
-    method mirrors the online event-driven update path described in the paper.
-    Retrieval uses the target decision clock c. In the default per-user
-    experimental clock, c is the target user's event step; in global mode, c is
-    the timestamp-sorted global event clock.
-    """
-
     def __init__(self, num_users: int, num_items: int, k_max: int, ttl: Optional[int] = None):
         self.num_users = int(num_users)
         self.num_items = int(num_items)
