@@ -1232,5 +1232,6 @@ if __name__ == "__main__":
         time_block_size=args.time_block_size,
         time_sigma=args.time_sigma,
         seed=args.seed,
+        clock_mode=args.clock_mode,
         device=args.device,
     )
