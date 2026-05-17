@@ -114,7 +114,14 @@ def _sample_event_delays(
     rng: np.random.Generator,
     cfg: DelayConfig,
 ) -> Tuple[List[int], float]:
-    """Sample clipped LogNormal integer delays for one user sequence."""
+    """Sample clipped LogNormal integer delays for one user sequence.
+
+    The delay is measured in the same clock units as the chosen experimental
+    clock. With clock_mode="per_user", one unit means one event step in the
+    user's own sequence, which matches Algorithm 2 and the severity table in
+    the manuscript. With clock_mode="global", one unit means one event in the
+    global timestamp-sorted stream.
+    """
     if T <= 0:
         return [], 0.0
 
@@ -123,17 +130,22 @@ def _sample_event_delays(
         user_scale = float(rng.lognormal(mean=cfg.mu_alpha, sigma=cfg.sigma_alpha))
 
     base = rng.lognormal(mean=cfg.mu, sigma=cfg.sigma, size=T)
+
+    # For time-varying delay, keep one scale per coarse temporal block rather
+    # than resampling the block factor for every event. This better matches the
+    # manuscript description of transient congestion/device-state changes.
+    block_scales: Dict[int, float] = {}
+    if cfg.variant in {"time", "user_time"}:
+        n_blocks = int(math.ceil(T / max(1, cfg.time_block_size)))
+        for block_id in range(n_blocks):
+            block_scales[block_id] = float(rng.lognormal(mean=0.0, sigma=cfg.time_sigma))
+
     delays: List[int] = []
     for idx in range(T):
         block_scale = 1.0
         if cfg.variant in {"time", "user_time"}:
-
-
             block_id = idx // max(1, cfg.time_block_size)
-
-
-            block_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)) + block_id)
-            block_scale = float(block_rng.lognormal(mean=0.0, sigma=cfg.time_sigma))
+            block_scale = block_scales.get(block_id, 1.0)
         val = int(math.floor(cfg.alpha * user_scale * block_scale * float(base[idx])))
         delays.append(min(cfg.lmax, max(0, val)))
     q = float(np.quantile(delays, cfg.quantile_p)) if delays else 0.0
@@ -146,26 +158,53 @@ def map_and_sample_delays(
     item2id: Dict[str, int],
     delay_cfg: DelayConfig,
     seed: int,
+    clock_mode: str = "per_user",
 ) -> List[MappedSequence]:
+    """Map raw sequences and sample observation delays.
+
+    clock_mode="per_user" uses event_clocks = 1, ..., T_u inside each user's
+    sequence. This exactly matches the manuscript's censored-history definition
+    t_obs = t + Delta and makes the missing-ratio severity settings interpretable
+    in units of user-event steps.
+
+    clock_mode="global" keeps the timestamp-sorted global event clock. It is
+    useful for production-style ablations, but its delay scale must be
+    recalibrated because one delay unit then means one global log event rather
+    than one user-history step.
+    """
+    if clock_mode not in {"per_user", "global"}:
+        raise ValueError("clock_mode must be either 'per_user' or 'global'.")
+
     rng = np.random.default_rng(seed)
 
-
-    global_events: List[Tuple[int, str, str, int]] = []
-    for raw_u, seq in raw_sequences.items():
-        for pos0, (raw_item, timestamp) in enumerate(seq):
-            global_events.append((int(timestamp), str(raw_u), str(raw_item), int(pos0)))
-    global_events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-    clock_by_user_pos = {
-        (raw_u, pos0): clock
-        for clock, (_, raw_u, _, pos0) in enumerate(global_events, start=1)
-    }
+    clock_by_user_pos: Dict[Tuple[str, int], int] = {}
+    if clock_mode == "global":
+        global_events: List[Tuple[int, str, str, int]] = []
+        for raw_u, seq in raw_sequences.items():
+            for pos0, (raw_item, timestamp) in enumerate(seq):
+                global_events.append((int(timestamp), str(raw_u), str(raw_item), int(pos0)))
+        global_events.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        clock_by_user_pos = {
+            (raw_u, pos0): clock
+            for clock, (_, raw_u, _, pos0) in enumerate(global_events, start=1)
+        }
 
     mapped: List[MappedSequence] = []
     for raw_u, seq in raw_sequences.items():
         uid = user2id[raw_u]
-        items = [item2id[item] for item, _ in seq if item in item2id]
-        ts = [int(t) for item, t in seq if item in item2id]
-        event_clocks = [clock_by_user_pos[(str(raw_u), pos0)] for pos0, (item, _) in enumerate(seq) if item in item2id]
+        items: List[int] = []
+        ts: List[int] = []
+        event_clocks: List[int] = []
+        for pos0, (item, timestamp) in enumerate(seq):
+            if item not in item2id:
+                continue
+            items.append(item2id[item])
+            ts.append(int(timestamp))
+            if clock_mode == "per_user":
+                event_clocks.append(pos0 + 1)
+            else:
+                event_clocks.append(clock_by_user_pos[(str(raw_u), pos0)])
+
         if len(items) < 3:
             continue
         delays, user_q = _sample_event_delays(len(items), rng, delay_cfg)
@@ -174,6 +213,7 @@ def map_and_sample_delays(
     if not mapped:
         raise ValueError("No mapped sequence with length >= 3.")
     return mapped
+
 
 def build_item_pop(mapped_sequences: Sequence[MappedSequence], num_items: int) -> List[float]:
     pop = [0.0] * (num_items + 1)
@@ -209,7 +249,9 @@ class ObservedBipartiteGraph:
 
     The buffers are pre-built for offline experiments, but the insert_event
     method mirrors the online event-driven update path described in the paper.
-    Retrieval uses the target decision step as the observation clock c.
+    Retrieval uses the target decision clock c. In the default per-user
+    experimental clock, c is the target user's event step; in global mode, c is
+    the timestamp-sorted global event clock.
     """
 
     def __init__(self, num_users: int, num_items: int, k_max: int, ttl: Optional[int] = None):
@@ -950,6 +992,7 @@ def train_model(
     time_block_size: int = 20,
     time_sigma: float = 0.35,
     seed: int = 42,
+    clock_mode: str = "per_user",
     device: Optional[str] = None,
 ):
     set_seed(seed)
@@ -978,7 +1021,7 @@ def train_model(
         time_sigma=time_sigma,
         quantile_p=delay_quantile_p,
     )
-    mapped = map_and_sample_delays(raw, user2id, item2id, delay_cfg, seed=seed)
+    mapped = map_and_sample_delays(raw, user2id, item2id, delay_cfg, seed=seed, clock_mode=clock_mode)
     num_users = len(user2id)
     num_items = len(item2id)
     item_pop = build_item_pop(mapped, num_items)
@@ -990,9 +1033,19 @@ def train_model(
     val_instances = build_instances(mapped, graph, split="val", max_len=max_len, delay_quantile_p=delay_quantile_p)
     test_instances = build_instances(mapped, graph, split="test", max_len=max_len, delay_quantile_p=delay_quantile_p)
 
+    def _avg_missing(instances: Sequence[CensoredInstance]) -> float:
+        if not instances:
+            return float("nan")
+        return float(np.mean([inst.missing_ratio for inst in instances]))
+
     print(
         f"Loaded users={num_users}, items={num_items}, train={len(train_instances)}, "
-        f"val={len(val_instances)}, test={len(test_instances)}, delay_variant={delay_variant}"
+        f"val={len(val_instances)}, test={len(test_instances)}, "
+        f"delay_variant={delay_variant}, clock_mode={clock_mode}"
+    )
+    print(
+        f"Avg missing ratio: train={_avg_missing(train_instances):.4f}, "
+        f"val={_avg_missing(val_instances):.4f}, test={_avg_missing(test_instances):.4f}"
     )
 
     train_loader = DataLoader(CensoredSeqDataset(train_instances, max_len, num_items, seen_by_user), batch_size=batch_size, shuffle=True)
@@ -1143,6 +1196,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--time_block_size", type=int, default=20)
     p.add_argument("--time_sigma", type=float, default=0.35)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--clock_mode", type=str, choices=["per_user", "global"], default="per_user")
     p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
@@ -1167,7 +1221,8 @@ if __name__ == "__main__":
     print(
         f"DGVD aligned: d={args.d}, K=[{args.k_min},{args.k_max}], "
         f"L=[{args.l_min},{args.lmax}], beta_K={args.beta_K}, beta_L={args.beta_L}, "
-        f"p={args.delay_quantile_p}, delay={args.delay_variant}, alpha={args.alpha}"
+        f"p={args.delay_quantile_p}, delay={args.delay_variant}, alpha={args.alpha}, "
+        f"clock_mode={args.clock_mode}"
     )
     train_model(
         data_root=data_root,
