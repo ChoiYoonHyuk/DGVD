@@ -537,7 +537,7 @@ class DGVDRec(nn.Module):
         self.Wi = nn.Linear(d, d, bias=False)
         self.Wj = nn.Linear(d, d, bias=False)
         self.Wtau = nn.Linear(d, d, bias=False)
-        self.Wedge = nn.Linear(3, d, bias=False)
+        self.Wedge = nn.Linear(2, d, bias=False)
         self.a = nn.Parameter(torch.randn(d) * 0.02)
         self.W_tau_layers = nn.ModuleList([nn.Embedding(self.lmax + 1, d * d) for _ in range(num_layers)])
         self.B_layers = nn.ModuleList([nn.Linear(d, d, bias=False) for _ in range(num_layers)])
@@ -575,10 +575,10 @@ class DGVDRec(nn.Module):
         vals = torch.clamp(vals, min=self.k_min, max=self.k_max)
         return vals
 
-    def _active_l_from_delay(self, missing_ratio: torch.Tensor, delay_q: torch.Tensor) -> torch.Tensor:
+    def _active_l_from_delay(self, age_stat: torch.Tensor, delay_q: torch.Tensor) -> torch.Tensor:
         if not self.adaptive_l:
-            return torch.full_like(missing_ratio.long(), self.lmax)
-        vals = torch.ceil(delay_q.float() + self.beta_l * missing_ratio.float() * float(self.lmax)).long()
+            return torch.full_like(delay_q.long(), self.lmax)
+        vals = torch.ceil(delay_q.float() + self.beta_l * age_stat.float() * float(self.lmax)).long()
         vals = torch.clamp(vals, min=self.l_min, max=self.lmax)
         return vals
 
@@ -673,11 +673,11 @@ class DGVDRec(nn.Module):
         src_neigh = src_neigh.masked_fill(mask_neigh.unsqueeze(-1), 0.0)
 
         tau_emb = self.lag_emb(tau_ids.squeeze(0).squeeze(0)).view(1, 1, Ltau, self.d)
+        age_stat = age_neigh.float().max(dim=1).values / max(1.0, float(self.lmax))
         edge_feat = torch.stack([
             lag_neigh.float() / max(1.0, float(self.lmax)),
             age_neigh.float() / max(1.0, float(self.lmax)),
-            missing_ratio.to(device).unsqueeze(1).expand(B, K),
-        ], dim=-1).unsqueeze(2).expand(B, K, Ltau, 3)
+        ], dim=-1).unsqueeze(2).expand(B, K, Ltau, 2)
 
         score = (
             self.Wi(h0).view(B, 1, 1, self.d)
